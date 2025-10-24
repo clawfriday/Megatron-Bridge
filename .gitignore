@@ -182,3 +182,6 @@ slurm*.out
 
 # UV package manager
 .uv/
+src/megatron/bridge/recipes/qwen/megatron_bridge_config_original.yaml
+src/megatron/bridge/recipes/qwen/megatron_bridge_config_chatGPT.yaml
+src/megatron/bridge/recipes/qwen/megatron_bridge_config.md
