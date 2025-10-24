@@ -314,6 +314,8 @@ def _qwen3_common(
             data_sharding=True,
             dataloader_type="single",
             skip_getting_attention_mask_from_dataset=True,
+            # EOS token swapping for performance optimization
+            # swap_eos_token=False,  # Set to True to enable numpy-level token swapping
         ),
         logger=LoggerConfig(
             log_interval=10,
