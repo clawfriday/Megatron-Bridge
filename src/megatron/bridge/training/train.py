@@ -233,7 +233,7 @@ def train(
 
     # Track train step elapsed time for throughput logging
     history_wct = None
-    if config.logger.log_throughput_to_wandb or config.logger.log_throughput_to_tensorboard:
+    if config.logger.log_throughput_to_tensorboard:
         history_wct = deque(maxlen=config.logger.throughput_window_size + 1)
     # Run training iterations till done.
     while global_state.train_state.step < train_config.train_iters:
@@ -369,8 +369,6 @@ def train(
             num_zeros_in_grad,
             config,
             global_state,
-            history_wct,
-            model,
             history_wct,
             model,
         )
