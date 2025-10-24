@@ -18,7 +18,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from functools import partial
-from typing import Any, Callable, Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,7 @@ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelpe
 from megatron.core.utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
 from megatron.bridge.training.config import ConfigContainer, TrainingConfig
+from megatron.bridge.training.forward_step_func_types import ForwardStepCallable
 from megatron.bridge.training.state import GlobalState, TrainState
 from megatron.bridge.training.utils.flop_utils import num_floating_point_operations
 from megatron.bridge.training.utils.theoretical_memory_utils import report_theoretical_memory
@@ -56,16 +57,17 @@ except ImportError:
         from megatron.core.utils import local_multi_tensor_l2_norm as multi_tensor_l2norm
 
 
-MEMORY_KEYS = {
-    "allocated_bytes.all.current": "current_allocated_mem",
-    "active_bytes.all.current": "current_active_mem",
-    "inactive_split_bytes.all.current": "current_inactive_mem",
-    "reserved_bytes.all.current": "current_reserved_mem",
-    "allocated_bytes.all.peak": "peak_allocated_mem",
-    "active_bytes.all.peak": "peak_active_mem",
-    "inactive_split_bytes.all.peak": "peak_inactive_mem",
-    "reserved_bytes.all.peak": "peak_reserved_mem",
-    "num_alloc_retries": "alloc_retries",
+MEMORY_KEYS: dict[str, str] = {
+    "allocated_bytes.all.current": "mem-allocated-bytes",
+    "active_bytes.all.current": "mem-active-bytes",
+    "inactive_split_bytes.all.current": "mem-inactive-bytes",
+    "reserved_bytes.all.current": "mem-reserved-bytes",
+    "allocated_bytes.all.peak": "mem-max-allocated-bytes",
+    "active_bytes.all.peak": "mem-max-active-bytes",
+    "inactive_split_bytes.all.peak": "mem-max-inactive-bytes",
+    "reserved_bytes.all.peak": "mem-max-reserved-bytes",
+    "num_alloc_retries": "mem-alloc-retires",
+    "allocation.all.current": "mem-allocated-count",
 }
 
 
@@ -184,14 +186,16 @@ def calc_params_l2_norm(
             False,  # no per-parameter norm.
         )
         sharded_norm_2 = sharded_norm * sharded_norm
-        # Sum over all DP groups, including CP since distributed optimizer state is
-        # sharded jointly over DP+CP.
-        torch.distributed.all_reduce(
-            sharded_norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=True),
-        )
-        norm_2 += sharded_norm_2
+    else:
+        sharded_norm_2 = torch.zeros((1,), dtype=torch.float32, device="cuda")
+    # Sum over all DP groups, including CP since distributed optimizer state is
+    # sharded jointly over DP+CP.
+    torch.distributed.all_reduce(
+        sharded_norm_2,
+        op=torch.distributed.ReduceOp.SUM,
+        group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+    )
+    norm_2 += sharded_norm_2
 
     # Add norm contribution from expert layers in MoEs.
     if len(moe_params_data) > 0:
@@ -325,7 +329,7 @@ def training_log(
     config: ConfigContainer,
     global_state: GlobalState,
     history_wct: list,
-    model,
+    model: list[MegatronModule],
 ) -> bool:
     """Log training stats (losses, learning rate, timings, etc.).
 
@@ -346,6 +350,8 @@ def training_log(
         num_zeros_in_grad (Optional[int]): Number of zeros in gradient if computed, else None.
         config: The main configuration container.
         global_state: The global training state.
+        history_wct (list): list of elapsed time per each iteration.
+        model (list[MegatronModule]): megatron model state.
 
     Returns:
         bool: The updated report_memory_flag.
@@ -434,7 +440,7 @@ def training_log(
 
                 with open(config.profiling.memory_snapshot_path, "wb") as f:
                     dump(snapshot, f)
-        if logger_config.log_throughput_to_wandb or logger_config.log_throughput_to_tensorboard:
+        if logger_config.log_throughput_to_tensorboard:
             throughput_report = report_throughput(
                 iteration=iteration,
                 train_config=train_config,
@@ -442,22 +448,18 @@ def training_log(
                 history_wct=history_wct,
                 window_size=logger_config.throughput_window_size,
             )
-
-            if wandb_writer and logger_config.log_throughput_to_wandb:
+            for metric, value in throughput_report.items():
+                writer.add_scalar(metric, value, iteration)
+            if wandb_writer:
                 wandb_writer.log(throughput_report, iteration)
-
-            if logger_config.log_throughput_to_tensorboard:
-                for metric, value in throughput_report.items():
-                    writer.add_scalar(metric, value, iteration)
-        if logger_config.log_memory_to_wandb or logger_config.log_memory_to_tensorboard:
+        if logger_config.log_memory_to_tensorboard:
             memory_report = report_memory(memory_keys=logger_config.memory_keys)
             memory_report = {f"memory/{mem_stat}": val for (mem_stat, val) in memory_report.items()}
-            if wandb_writer and logger_config.log_memory_to_wandb:
+            for metric, value in memory_report.items():
+                writer.add_scalar(metric, value, iteration)
+            if wandb_writer:
                 wandb_writer.log(memory_report, iteration)
-            if logger_config.log_memory_to_tensorboard:
-                for metric, value in memory_report.items():
-                    writer.add_scalar(metric, value, iteration)
-        if logger_config.log_runtime_to_wandb or logger_config.log_runtime_to_tensorboard:
+        if logger_config.log_runtime_to_tensorboard:
             runtime_report = report_runtime(
                 train_state=train_state,
                 start_time=global_state.start_time,
@@ -465,18 +467,16 @@ def training_log(
                 train_iters=train_config.train_iters,
                 time_unit=logger_config.runtime_time_unit,
             )
-            if wandb_writer and logger_config.log_runtime_to_wandb:
+            for metric, value in runtime_report.items():
+                writer.add_scalar(metric, value, iteration)
+            if wandb_writer:
                 wandb_writer.log(runtime_report, iteration)
-            if logger_config.log_runtime_to_tensorboard:
-                for metric, value in runtime_report:
-                    writer.add_scalar(metric, value, iteration)
-        if logger_config.log_l2_norm_grad_to_wandb or logger_config.log_l2_norm_grad_to_tensorboard:
+        if logger_config.log_l2_norm_grad_to_tensorboard:
             l2_report = report_l2_norm_grad(model)
-            if wandb_writer and logger_config.log_l2_norm_grad_to_wandb:
+            for metric, value in l2_report.items():
+                writer.add_scalar(metric, value, iteration)
+            if wandb_writer:
                 wandb_writer.log(l2_report, iteration)
-            if logger_config.log_l2_norm_grad_to_tensorboard:
-                for metric, value in l2_report.items():
-                    writer.add_scalar(metric, value, iteration)
         if wandb_writer:
             wandb_writer.log({"samples vs steps": train_state.consumed_train_samples}, iteration)
         writer.add_scalar("learning-rate", learning_rate, iteration)
@@ -531,8 +531,14 @@ def training_log(
     if config.model.num_moe_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
-        if config.model.moe_router_load_balancing_type in ("aux_loss", "seq_aux_loss"):
+
+        moe_router_load_balancing_type = config.model.moe_router_load_balancing_type
+        if "aux_loss" in moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
+        if "seq_aux_loss" in moe_router_load_balancing_type:
+            track_names.append("seq_load_balancing_loss")
+        if "global_aux_loss" in moe_router_load_balancing_type:
+            track_names.append("global_load_balancing_loss")
         if config.model.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
         track_moe_metrics(
@@ -565,11 +571,9 @@ def training_log(
             if writer:
                 writer.add_scalar("throughput/tflops/device", per_gpu_tf, iteration)
                 writer.add_scalar("throughput/tflops", per_gpu_tf * get_world_size_safe(), iteration)
-
-        if logger_config.log_throughput_to_wandb:
-            if wandb_writer:
-                wandb_writer.log({"throughput/tflops/device": per_gpu_tf}, iteration)
-                wandb_writer.log({"throughput/tflops": per_gpu_tf * get_world_size_safe()}, iteration)
+                if wandb_writer:
+                    wandb_writer.log({"throughput/tflops/device": per_gpu_tf}, iteration)
+                    wandb_writer.log({"throughput/tflops": per_gpu_tf * get_world_size_safe()}, iteration)
 
         if logger_config.log_timers_to_tensorboard:
             if writer:
@@ -699,7 +703,7 @@ def report_memory(memory_keys: Optional[dict[str, str]]) -> dict:
     return memory_report
 
 
-def report_l2_norm_grad(model: Union[MegatronModule, list[MegatronModule]]) -> dict:
+def report_l2_norm_grad(model: list[MegatronModule]) -> dict:
     """
     Computes and logs the L2 norm of gradients.
     L2 norms are calculated after the reduction of gradients across GPUs. This function iterates over the parameters
@@ -728,7 +732,6 @@ def report_l2_norm_grad(model: Union[MegatronModule, list[MegatronModule]]) -> d
     for model_chunk in model:
         for name, p in model_chunk.named_parameters():
             if p.main_grad is not None and p.requires_grad:
-                # Always log grad norm as a default metric if it's not specified
                 if f"l2_norm/grad/{name}" not in optimizer_metrics:
                     param_grad_norm = torch.linalg.vector_norm(p.main_grad)
                     optimizer_metrics[f"l2_norm/grad/{name}"] = param_grad_norm
@@ -882,57 +885,101 @@ def report_throughput(
     return {}
 
 
-def maybe_inject_state(forward_step_func: Callable, state: GlobalState, num_fw_args: Optional[int] = None) -> Callable:
-    """Optionally inject GlobalState into a 4-arg forward_step function.
+def prepare_forward_step_func(forward_step_func: ForwardStepCallable, state: GlobalState) -> ForwardStepCallable:
+    """Convenience function to check and inject GlobalState in one call.
 
-    - If the function has 4 parameters (state, data_iterator, model, return_schedule_plan),
-      bind the provided state via functools.partial to produce a callable that accepts
-      (data_iterator, model, return_schedule_plan).
-    - If the function already has 3 parameters (data_iterator, model, return_schedule_plan)
-      or 2 parameters (data_iterator, model), return it unchanged.
+    This combines needs_global_state_injection() and maybe_inject_state() for cleaner code.
+    Call this once at the beginning of train() or evaluate() to prevent creating new
+    partial objects every iteration.
+
+    Wrapping once is safe since:
+    - functools.partial stores a reference to the state object, not a copy
+    - When state.train_state.step or other fields change, the partial sees those changes
+    - No staleness issues because GlobalState is mutable and passed by reference
+
+    Functor support:
+    - Works with both regular functions (def forward_step(...)) and callable classes
+    - For functors: inspect.signature() inspects the __call__ method
+    - For functors: partial(functor_instance, state) preserves functor's internal state
+    - Example: If functor has self.call_count, it still increments correctly
+
+    Args:
+        forward_step_func: The original forward step function or functor
+        state: The GlobalState object to inject if needed
+
+    Returns:
+        The wrapped function (if injection needed) or original function
+    """
+    needs_injection = needs_global_state_injection(forward_step_func)
+    return maybe_inject_state(forward_step_func, state, needs_injection=needs_injection)
+
+
+def needs_global_state_injection(forward_step_func: ForwardStepCallable) -> bool:
+    """Check if a forward step function needs GlobalState injection.
+
+    This function does the signature inspection once to determine if state should be injected.
+    It's more efficient than repeated signature inspection in the training loop.
+
+    Detection logic:
+    1. First checks for GlobalState type annotation in any parameter
+    2. Falls back to checking if first parameter is named 'state' or 'global_state'
+
+    Args:
+        forward_step_func: The forward step function to inspect.
+
+    Returns:
+        True if GlobalState should be injected, False otherwise.
+    """
+    signature = inspect.signature(forward_step_func)
+    parameters = signature.parameters
+    param_names = list(parameters.keys())
+
+    # Check for GlobalState type annotation in any parameter
+    for param_name, param in parameters.items():
+        if param.annotation != inspect.Parameter.empty:
+            # Handle both direct GlobalState and string annotations
+            if (
+                param.annotation == GlobalState
+                or (isinstance(param.annotation, str) and "GlobalState" in param.annotation)
+                or (hasattr(param.annotation, "__name__") and param.annotation.__name__ == "GlobalState")
+            ):
+                # Found GlobalState annotation - needs injection
+                return True
+
+    # Fallback: Check if the first parameter is named 'state' or 'global_state'
+    return param_names and param_names[0] in ("state", "global_state")
+
+
+def maybe_inject_state(
+    forward_step_func: ForwardStepCallable, state: GlobalState, needs_injection: Optional[bool] = None
+) -> ForwardStepCallable:
+    """Optionally inject GlobalState into forward_step functions that expect it.
+
+    Determines whether to inject state by inspecting function signature:
+    1. First checks for GlobalState type annotation in any parameter
+    2. Falls back to checking if first parameter is named 'state'
+    3. Otherwise assumes the function doesn't expect state
+
+    Supported signatures:
+    - (data_iterator, model) → no injection
+    - (data_iterator, model, return_schedule_plan) → no injection
+    - (state: GlobalState, data_iterator, model) → inject state
+    - (state: GlobalState, data_iterator, model, return_schedule_plan) → inject state
+    - (state, data_iterator, model) → inject state (fallback to name-based detection)
 
     Args:
         forward_step_func: The original forward step function.
         state: The GlobalState object to potentially inject.
-        num_fw_args: The number of arguments the forward_step_func expects (optional,
-                     will be inspected if None).
+        needs_injection: Whether injection is needed (optional, will be inspected if None).
+                        Pass this to avoid repeated signature inspection in training loops.
 
     Returns:
         The original function or a partial function with GlobalState injected.
     """
-    if not num_fw_args:
-        num_fw_args = len(inspect.signature(forward_step_func).parameters)
-    if num_fw_args == 4:  # megatron bridge gpt_step.py forward_step has 4 args
-        # inject global_state
+    if needs_injection is None:
+        needs_injection = needs_global_state_injection(forward_step_func)
+
+    if needs_injection:
         return partial(forward_step_func, state)
     else:
         return forward_step_func
-
-
-def check_forward_step_func_num_args(forward_step_func: Callable) -> int:
-    """Check if the forward step function has a supported number of arguments.
-
-    Currently supports 2, 3, or 4 arguments:
-    - func(data_iterator, model)
-    - func(data_iterator, model, return_schedule_plan: bool = False)  # state pre-bound via partial
-    - func(state, data_iterator, model, return_schedule_plan: bool = False)
-
-    Args:
-        forward_step_func: The function to check.
-
-    Returns:
-        The number of arguments the function takes.
-
-    Raises:
-        AssertionError: If the function does not have 2 or 4 arguments.
-    """
-    num_fw_args = len(inspect.signature(forward_step_func).parameters)
-    fail_msg = f"""
-    forward_step_func has {num_fw_args} arguments. Only the following signatures are supported:
-        2 args: forward_step_func(data_iterator: Iterable, model: GPTModel)
-        3 args: forward_step_func(data_iterator: Iterable, model: GPTModel, return_schedule_plan: bool = False)
-        4 args: forward_step_func(state: GlobalState, data_iterator: Iterable, model: GPTModel, return_schedule_plan: bool = False)
-    """
-    assert num_fw_args in (2, 3, 4), fail_msg
-
-    return num_fw_args
