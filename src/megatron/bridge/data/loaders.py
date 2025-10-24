@@ -68,13 +68,14 @@ def get_blend_and_blend_per_split(
 
     blend = None
     blend_per_split = None
-    # IGNORE: use external blend info file
+    # if we only supply a data_paths here, it will auto-split it into train, valid, test
     if use_data_path:
         if data_args_path is not None:
             assert data_paths is None
             with open(data_args_path, "r") as f:
                 blend = get_blend_from_list(f.read().split())
         else:
+            # this is the case where the autosplit is done
             assert data_paths is not None
             blend = get_blend_from_list(data_paths)
     elif use_per_split_data_path:
