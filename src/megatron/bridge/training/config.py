@@ -649,6 +649,9 @@ class CheckpointConfig:
     pretrained_checkpoint: Optional[str] = None
     """Directory containing a pretrained model checkpoint for finetuning."""
 
+    hf_pretrained_checkpoint: Optional[str] = None
+    """Path to HuggingFace pretrained model for direct loading (bypasses checkpoint conversion)."""
+
     ckpt_step: Optional[int] = None
     """Checkpoint step to load model from."""
 
