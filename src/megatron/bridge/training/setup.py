@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import inspect
 import logging
 import time
@@ -269,7 +270,9 @@ def setup(
     if get_rank_safe() == 0:
         # Print final resolved/updated/overridden configs
         print("------- Task Configuration -------")
-        cfg.print_yaml()
+        log_dir = os.environ.get("LOG_DIR", "./logs")
+        final_config_path = os.path.join(log_dir, "recipe", "final.yaml")
+        cfg.to_yaml(final_config_path)
         print("----------------------------------")
 
     return SetupOutput(
