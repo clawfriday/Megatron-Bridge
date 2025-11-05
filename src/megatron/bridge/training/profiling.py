@@ -20,7 +20,7 @@ import torch
 import torch.profiler
 
 from megatron.bridge.training.config import ProfilingConfig
-
+from megatron.bridge.utils.common_utils import print_rank_0
 
 # Type alias for NVTX context manager
 TNvtxContext = torch.autograd.profiler.emit_nvtx
@@ -154,3 +154,24 @@ def stop_nsys_profiler(nvtx_context: Optional[TNvtxContext]) -> None:
     torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
     if nvtx_context is not None:
         nvtx_context.__exit__(None, None, None)
+
+def _print_gpu_memory_usage(stage_name: str) -> None:
+    """Print GPU memory usage at a specific stage.
+    
+    Args:
+        stage_name: Name of the stage for logging purposes
+    """
+    if not torch.cuda.is_available():
+        print_rank_0(f"[{stage_name}] CUDA not available, skipping memory report")
+        return
+    
+    # Get memory stats
+    reserved = torch.cuda.memory_reserved() / 1e9  # GB
+    
+    # Get device properties for total memory
+    device = torch.cuda.current_device()
+    total_memory = torch.cuda.get_device_properties(device).total_memory / 1e9  # GB
+    
+    print_rank_0(f"[{stage_name}] GPU Memory Usage:")
+    print_rank_0(f"  Reserved:  {reserved:.2f} GB")
+    print_rank_0(f"  Free: {(total_memory - reserved):.2f} GB")
