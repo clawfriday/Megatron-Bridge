@@ -175,3 +175,79 @@ def _print_gpu_memory_usage(stage_name: str) -> None:
     print_rank_0(f"[{stage_name}] GPU Memory Usage:")
     print_rank_0(f"  Reserved:  {reserved:.2f} GB")
     print_rank_0(f"  Free: {(total_memory - reserved):.2f} GB")
+
+def get_tensor_dict_size(d):
+    """Recursively calculate actual tensor memory in a nested dict."""
+    total = 0
+    for key, value in d.items():
+        if isinstance(value, torch.Tensor):
+            total += value.element_size() * value.numel()
+        elif isinstance(value, dict):
+            total += get_tensor_dict_size(value)
+        elif hasattr(value, 'data') and isinstance(value.data, torch.Tensor):
+            # Handle ShardedTensor or similar wrapper objects
+            total += value.data.element_size() * value.data.numel()
+        elif hasattr(value, 'local_shards'):
+            # Handle ShardedTensor with local_shards attribute
+            for shard in value.local_shards:
+                if hasattr(shard, 'tensor') and isinstance(shard.tensor, torch.Tensor):
+                    total += shard.tensor.element_size() * shard.tensor.numel()
+        elif hasattr(value, '_tensor') and isinstance(value._tensor, torch.Tensor):
+            # Handle objects with _tensor attribute
+            total += value._tensor.element_size() * value._tensor.numel()
+    return total
+
+def get_tensor_size(value):
+    """Get size of a single tensor or wrapped tensor object."""
+    if isinstance(value, torch.Tensor):
+        return value.element_size() * value.numel()
+    elif hasattr(value, 'data') and isinstance(value.data, torch.Tensor):
+        return value.data.element_size() * value.data.numel()
+    elif hasattr(value, 'local_shards'):
+        total = 0
+        for shard in value.local_shards:
+            if hasattr(shard, 'tensor') and isinstance(shard.tensor, torch.Tensor):
+                total += shard.tensor.element_size() * shard.tensor.numel()
+        return total
+    elif hasattr(value, '_tensor') and isinstance(value._tensor, torch.Tensor):
+        return value._tensor.element_size() * value._tensor.numel()
+    return 0
+
+def print_itemized_state_dict_size(d, prefix="", max_depth=5, current_depth=0):
+    """Recursively print itemized sizes of state dict components."""
+    if current_depth >= max_depth:
+        return
+    
+    items = []
+    for key, value in d.items():
+        if isinstance(value, dict):
+            size = get_tensor_dict_size(value)
+            items.append((key, value, size, True))
+        else:
+            size = get_tensor_size(value)
+            items.append((key, value, size, False))
+    
+    # Sort by size (largest first)
+    items.sort(key=lambda x: x[2], reverse=True)
+    
+    for key, value, size, is_dict in items:
+        if size == 0:
+            continue  # Skip zero-size items
+        
+        # Format size
+        if size >= 1024**3:
+            size_str = f"{size / (1024**3):.2f} GB"
+        elif size >= 1024**2:
+            size_str = f"{size / (1024**2):.2f} MB"
+        elif size >= 1024:
+            size_str = f"{size / 1024:.2f} KB"
+        else:
+            size_str = f"{size} B"
+        
+        # Print with indentation
+        indent = "  " * current_depth
+        print_rank_0(f"{indent}{prefix}{key}: {size_str}")
+        
+        # Recurse into dictionaries
+        if is_dict and current_depth < max_depth - 1:
+            print_itemized_state_dict_size(value, prefix="", max_depth=max_depth, current_depth=current_depth + 1)
