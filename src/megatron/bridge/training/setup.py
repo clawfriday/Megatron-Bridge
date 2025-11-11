@@ -177,9 +177,12 @@ def setup(
     hf_path = getattr(cfg.checkpoint, 'hf_pretrained_checkpoint', None)
     print_rank_0(f"Debug: hf_pretrained_checkpoint = {hf_path}")
     if hf_path is not None:
-        hf_hook = _create_hf_loading_hook(cfg, state)
-        cfg.model.register_pre_wrap_hook(hf_hook)
-        print_rank_0("Registered HuggingFace loading pre-wrap hook")
+        if cfg.checkpoint.load is None or not checkpoint_exists(cfg.checkpoint.load):
+            hf_hook = _create_hf_loading_hook(cfg, state)
+            cfg.model.register_pre_wrap_hook(hf_hook)
+            print_rank_0("Registered HuggingFace loading pre-wrap hook")
+        else:
+            print_rank_0("Skipping HuggingFace loading - using checkpoint loading instead")
     else:
         print_rank_0("Debug: hf_pretrained_checkpoint is None, skipping HuggingFace loading hook")
     
@@ -216,11 +219,6 @@ def setup(
             # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
             # This is switched off here in order to load these states from the checkpoint
             cfg.checkpoint.finetune = False
-    # Skip regular checkpoint loading if using HuggingFace loading
-    elif getattr(cfg.checkpoint, 'hf_pretrained_checkpoint', None) is not None:
-        should_load_checkpoint = False
-        print_rank_0("Skipping regular checkpoint loading - using HuggingFace loading instead")
-        print_rank_0(f"Debug: hf_pretrained_checkpoint = {cfg.checkpoint.hf_pretrained_checkpoint}")
     else:
         should_load_checkpoint = (cfg.checkpoint.load is not None and checkpoint_exists(cfg.checkpoint.load)) or (cfg.checkpoint.pretrained_checkpoint is not None and checkpoint_exists(cfg.checkpoint.pretrained_checkpoint))
 
@@ -341,6 +339,7 @@ def _create_hf_loading_hook(cfg: ConfigContainer, state: GlobalState) -> Callabl
             List of model modules with HuggingFace weights loaded
         """
         from megatron.bridge.models.conversion.auto_bridge import AutoBridge
+        from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
         
         hf_path = cfg.checkpoint.hf_pretrained_checkpoint
         print_rank_0(f"Loading HuggingFace weights from: {hf_path}")
@@ -360,13 +359,9 @@ def _create_hf_loading_hook(cfg: ConfigContainer, state: GlobalState) -> Callabl
             # Create AutoBridge for the HuggingFace model
             print_rank_0(f"Creating AutoBridge from config...")
             bridge = AutoBridge.from_hf_config(hf_pretrained_loader.config)
-
-            megatron_model_list = model
-            internal_model_bridge = bridge._model_bridge
-            
-            internal_model_bridge.load_weights_hf_to_megatron(
+            bridge._model_bridge.load_weights_hf_to_megatron(
                 hf_pretrained_loader,
-                megatron_model_list
+                model
             )
             print_rank_0("Successfully loaded HuggingFace weights into Megatron model.")
         
